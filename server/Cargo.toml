@@ -1,0 +1,10 @@
+[package]
+name = "rbackup2-server"
+version = "0.1.0"
+authors = ["Jan Kolena <jendakolena@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+rdedup-lib = { path = "../libs/rdedup/lib" }
+sgdata = { path = "../libs/rdedup/sgdata" }
+url = "~2"
