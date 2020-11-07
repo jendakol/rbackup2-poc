@@ -7,7 +7,7 @@ use sgdata::SGData;
 /// A lock held on the backend
 ///
 /// It doesn't do much, except unlock on `drop`.
-pub(crate) trait Lock {}
+pub trait Lock {}
 
 /// Backend API
 ///

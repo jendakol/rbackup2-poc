@@ -14,13 +14,15 @@ use slog_perf::TimeReporter;
 use url::Url;
 
 mod local;
-pub(crate) use self::local::Local;
+pub use self::local::Local;
 mod b2;
 pub(crate) use self::b2::B2;
 
 mod backend;
-use self::backend::*;
-pub use backend::{Backend, BackendThread};
+mod remote;
+
+use crate::aio::remote::RemoteBackend;
+pub use backend::{Backend, BackendThread, Lock};
 
 // {{{ Misc
 struct WriteArgs {
@@ -30,9 +32,9 @@ struct WriteArgs {
     complete_tx: Option<mpsc::Sender<io::Result<()>>>,
 }
 
-pub(crate) struct Metadata {
-    _len: u64,
-    _is_file: bool,
+pub struct Metadata {
+    pub _len: u64,
+    pub _is_file: bool,
 }
 
 /// A result of async io operation
@@ -89,10 +91,7 @@ pub struct AsyncIO {
 }
 
 impl AsyncIO {
-    pub(crate) fn new(
-        backend: Box<dyn Backend + Send + Sync>,
-        log: Logger,
-    ) -> io::Result<Self> {
+    pub(crate) fn new(backend: Box<dyn Backend + Send + Sync>, log: Logger) -> io::Result<Self> {
         let thread_num = 4 * num_cpus::get();
         let (tx, rx) = crossbeam_channel::bounded(thread_num);
 
@@ -105,8 +104,7 @@ impl AsyncIO {
                 let log = log.clone();
                 let backend = backend.new_thread()?;
                 Ok(thread::spawn(move || {
-                    let mut thread =
-                        AsyncIOThread::new(shared, rx, backend, log);
+                    let mut thread = AsyncIOThread::new(shared, rx, backend, log);
                     thread.run();
                 }))
             })
@@ -147,28 +145,21 @@ impl AsyncIO {
 
     pub fn list(&self, path: PathBuf) -> AsyncIOResult<Vec<PathBuf>> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(Message::List(path, tx))
-            .expect("aio tx closed: list");
+        self.tx.send(Message::List(path, tx)).expect("aio tx closed: list");
         AsyncIOResult { rx }
     }
 
     // TODO: No need for it anymore?
     #[allow(dead_code)]
-    pub fn list_recursively(
-        &self,
-        path: PathBuf,
-    ) -> Box<dyn Iterator<Item = io::Result<PathBuf>>> {
+    pub fn list_recursively(&self, path: PathBuf) -> Box<dyn Iterator<Item = io::Result<PathBuf>>> {
         let (tx, rx) = mpsc::channel();
         self.tx
             .send(Message::ListRecursively(path, tx))
             .expect("aio tx closed: list_recursively");
 
         let iter = rx.into_iter().flat_map(|batch| match batch {
-            Ok(batch) => Box::new(batch.into_iter().map(Ok))
-                as Box<dyn Iterator<Item = io::Result<PathBuf>>>,
-            Err(e) => Box::new(Some(Err(e)).into_iter())
-                as Box<dyn Iterator<Item = io::Result<PathBuf>>>,
+            Ok(batch) => Box::new(batch.into_iter().map(Ok)) as Box<dyn Iterator<Item = io::Result<PathBuf>>>,
+            Err(e) => Box::new(Some(Err(e)).into_iter()) as Box<dyn Iterator<Item = io::Result<PathBuf>>>,
         });
         Box::new(iter)
     }
@@ -188,11 +179,7 @@ impl AsyncIO {
 
     // TODO: No need for it anymore
     #[allow(dead_code)]
-    pub fn write_idempotent(
-        &self,
-        path: PathBuf,
-        sg: SGData,
-    ) -> AsyncIOResult<()> {
+    pub fn write_idempotent(&self, path: PathBuf, sg: SGData) -> AsyncIOResult<()> {
         let (tx, rx) = mpsc::channel();
         self.tx
             .send(Message::Write(WriteArgs {
@@ -233,28 +220,19 @@ impl AsyncIO {
 
     pub fn read(&self, path: PathBuf) -> AsyncIOResult<SGData> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(Message::Read(path, tx))
-            .expect("aio tx closed: read");
+        self.tx.send(Message::Read(path, tx)).expect("aio tx closed: read");
         AsyncIOResult { rx }
     }
 
-    pub(crate) fn read_metadata(
-        &self,
-        path: PathBuf,
-    ) -> AsyncIOResult<Metadata> {
+    pub(crate) fn read_metadata(&self, path: PathBuf) -> AsyncIOResult<Metadata> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(Message::ReadMetadata(path, tx))
-            .expect("aio tx closed: read_metadata");
+        self.tx.send(Message::ReadMetadata(path, tx)).expect("aio tx closed: read_metadata");
         AsyncIOResult { rx }
     }
 
     pub fn remove(&self, path: PathBuf) -> AsyncIOResult<()> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(Message::Remove(path, tx))
-            .expect("aio tx closed: remove");
+        self.tx.send(Message::Remove(path, tx)).expect("aio tx closed: remove");
         AsyncIOResult { rx }
     }
 
@@ -268,9 +246,7 @@ impl AsyncIO {
 
     pub fn rename(&self, src: PathBuf, dst: PathBuf) -> AsyncIOResult<()> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(Message::Rename(src, dst, tx))
-            .expect("aio tx closed: rename");
+        self.tx.send(Message::Rename(src, dst, tx)).expect("aio tx closed: rename");
         AsyncIOResult { rx }
     }
 }
@@ -367,17 +343,8 @@ impl<'a, 'b> Drop for PendingGuard<'a, 'b> {
 }
 
 impl AsyncIOThread {
-    fn new(
-        shared: AsyncIOThreadShared,
-        rx: crossbeam_channel::Receiver<Message>,
-        backend: Box<dyn BackendThread>,
-        log: Logger,
-    ) -> Self {
-        let t = TimeReporter::new_with_level(
-            "chunk-writer",
-            log.clone(),
-            Level::Debug,
-        );
+    fn new(shared: AsyncIOThreadShared, rx: crossbeam_channel::Receiver<Message>, backend: Box<dyn BackendThread>, log: Logger) -> Self {
+        let t = TimeReporter::new_with_level("chunk-writer", log.clone(), Level::Debug);
         AsyncIOThread {
             log: log.new(o!("module" => "asyncio")),
             shared,
@@ -400,20 +367,12 @@ impl AsyncIOThread {
                         complete_tx,
                     }) => self.write(path, data, idempotent, complete_tx),
                     Message::Read(path, tx) => self.read(path, tx),
-                    Message::ReadMetadata(path, tx) => {
-                        self.read_metadata(path, tx)
-                    }
+                    Message::ReadMetadata(path, tx) => self.read_metadata(path, tx),
                     Message::List(path, tx) => self.list(path, tx),
-                    Message::ListRecursively(path, tx) => {
-                        self.list_recursively(path, tx)
-                    }
+                    Message::ListRecursively(path, tx) => self.list_recursively(path, tx),
                     Message::Remove(path, tx) => self.remove(path, tx),
-                    Message::RemoveDirAll(path, tx) => {
-                        self.remove_dir_all(path, tx)
-                    }
-                    Message::Rename(src_path, dst_path, tx) => {
-                        self.rename(src_path, dst_path, tx)
-                    }
+                    Message::RemoveDirAll(path, tx) => self.remove_dir_all(path, tx),
+                    Message::Rename(src_path, dst_path, tx) => self.rename(src_path, dst_path, tx),
                 }
             } else {
                 break;
@@ -421,12 +380,7 @@ impl AsyncIOThread {
         }
     }
 
-    fn write_inner(
-        &mut self,
-        path: PathBuf,
-        sg: SGData,
-        idempotent: bool,
-    ) -> io::Result<()> {
+    fn write_inner(&mut self, path: PathBuf, sg: SGData, idempotent: bool) -> io::Result<()> {
         // check `in_progress` and add atomically
         // if not already there
         loop {
@@ -448,10 +402,7 @@ impl AsyncIOThread {
         }
 
         let len = sg.len();
-        let res = self
-            .backend
-            .borrow_mut()
-            .write(path.clone(), sg, idempotent);
+        let res = self.backend.borrow_mut().write(path.clone(), sg, idempotent);
         {
             let mut sh = self.shared.inner.lock().unwrap();
             sh.in_progress.remove(&path);
@@ -462,13 +413,7 @@ impl AsyncIOThread {
         res
     }
 
-    fn write(
-        &mut self,
-        path: PathBuf,
-        sg: SGData,
-        idempotent: bool,
-        tx: Option<mpsc::Sender<io::Result<()>>>,
-    ) {
+    fn write(&mut self, path: PathBuf, sg: SGData, idempotent: bool, tx: Option<mpsc::Sender<io::Result<()>>>) {
         trace!(self.log, "write"; "path" => %path.display());
 
         self.time_reporter.start("read");
@@ -482,10 +427,7 @@ impl AsyncIOThread {
         }
     }
 
-    fn pending_wait_and_insert<'a, 'path>(
-        &'a self,
-        path: &'path PathBuf,
-    ) -> PendingGuard<'a, 'path> {
+    fn pending_wait_and_insert<'a, 'path>(&'a self, path: &'path PathBuf) -> PendingGuard<'a, 'path> {
         loop {
             let mut sh = self.shared.inner.lock().unwrap();
 
@@ -514,11 +456,7 @@ impl AsyncIOThread {
         tx.send(res).expect("send failed")
     }
 
-    fn read_metadata(
-        &mut self,
-        path: PathBuf,
-        tx: mpsc::Sender<io::Result<Metadata>>,
-    ) {
+    fn read_metadata(&mut self, path: PathBuf, tx: mpsc::Sender<io::Result<Metadata>>) {
         trace!(self.log, "read-metadata"; "path" => %path.display());
 
         self.time_reporter.start("read-metadata");
@@ -531,11 +469,7 @@ impl AsyncIOThread {
         tx.send(res).expect("send failed")
     }
 
-    fn list(
-        &mut self,
-        path: PathBuf,
-        tx: mpsc::Sender<io::Result<Vec<PathBuf>>>,
-    ) {
+    fn list(&mut self, path: PathBuf, tx: mpsc::Sender<io::Result<Vec<PathBuf>>>) {
         trace!(self.log, "list"; "path" => %path.display());
 
         self.time_reporter.start("list");
@@ -544,11 +478,7 @@ impl AsyncIOThread {
         tx.send(res).expect("send failed")
     }
 
-    fn list_recursively(
-        &mut self,
-        path: PathBuf,
-        tx: mpsc::Sender<io::Result<Vec<PathBuf>>>,
-    ) {
+    fn list_recursively(&mut self, path: PathBuf, tx: mpsc::Sender<io::Result<Vec<PathBuf>>>) {
         trace!(self.log, "list"; "path" => %path.display());
         self.time_reporter.start("list");
 
@@ -567,11 +497,7 @@ impl AsyncIOThread {
         tx.send(res).expect("send failed")
     }
 
-    fn remove_dir_all(
-        &mut self,
-        path: PathBuf,
-        tx: mpsc::Sender<io::Result<()>>,
-    ) {
+    fn remove_dir_all(&mut self, path: PathBuf, tx: mpsc::Sender<io::Result<()>>) {
         trace!(self.log, "remove-dir-all"; "path" => %path.display());
 
         self.time_reporter.start("remove-dir-all");
@@ -581,12 +507,7 @@ impl AsyncIOThread {
         tx.send(res).expect("send failed")
     }
 
-    fn rename(
-        &mut self,
-        src_path: PathBuf,
-        dst_path: PathBuf,
-        tx: mpsc::Sender<io::Result<()>>,
-    ) {
+    fn rename(&mut self, src_path: PathBuf, dst_path: PathBuf, tx: mpsc::Sender<io::Result<()>>) {
         trace!(
             self.log,
             "rename";
@@ -598,9 +519,7 @@ impl AsyncIOThread {
         let res = {
             let _guard = self.pending_wait_and_insert(&src_path);
             let _guard = self.pending_wait_and_insert(&dst_path);
-            self.backend
-                .borrow_mut()
-                .rename(src_path.clone(), dst_path.clone())
+            self.backend.borrow_mut().rename(src_path.clone(), dst_path.clone())
         };
         self.time_reporter.start("remove send response");
         tx.send(res).expect("send failed")
@@ -613,34 +532,23 @@ impl AsyncIOThread {
 // let s = "file:/foo/bar";
 // let s = "b2:myid#bucket";
 // ```
-pub(crate) fn backend_from_url(
-    u: &Url,
-) -> io::Result<Box<dyn Backend + Send + Sync>> {
-    if u.scheme() == "file" {
+pub(crate) fn backend_from_url(u: &Url) -> io::Result<Box<dyn Backend + Send + Sync>> {
+    if u.scheme() == "http" {
+        return Ok(Box::new(RemoteBackend::new(url2::Url::parse(&u.to_string()).unwrap())));
+    } else if u.scheme() == "file" {
         return Ok(Box::new(Local::new(u.to_file_path().unwrap())));
     } else if u.scheme() == "b2" {
         let id = u.path();
-        let bucket = u.fragment().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "bucket in the url missing",
-            )
-        })?;
+        let bucket = u
+            .fragment()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bucket in the url missing"))?;
         let key = std::env::var_os("RDEDUP_B2_KEY")
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "RDEDUP_B2_KEY environment variable not found",
-                )
-            })?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "RDEDUP_B2_KEY environment variable not found"))?
             .into_string()
             .map_err(|os_string| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!(
-                        "b2 key is not utf8 string: {}",
-                        os_string.to_string_lossy()
-                    ),
+                    format!("b2 key is not utf8 string: {}", os_string.to_string_lossy()),
                 )
             })?;
         return Ok(Box::new(B2::new(id, bucket, &key)));

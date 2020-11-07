@@ -24,6 +24,15 @@ with-xz2 = ["rust-lzma"]
 with-zstd = ["zstd"]
 
 [dependencies]
+once_cell = "~1.3"
+reqwest = { version = "~0.10", features = ["json", "stream", "blocking", "gzip"] }
+err-context = "~0.1"
+futures = "~0.3"
+libcommon = { path = "../../common" }
+log = "0.4.11"
+url2 = { version = "2.2", package = "url" }
+uuid = { version = "~0.8", features = ["serde", "v4"] }
+
 rdedup-cdc = "0.1.0"
 sodiumoxide = { version = "0.2", features = ["serde"] }
 fs2 = "0.4"

@@ -18,9 +18,8 @@ mod iterators;
 
 mod config;
 
-mod aio;
+pub mod aio;
 use crate::aio::*;
-pub use aio::{Backend, BackendThread};
 
 mod chunking;
 mod hashing;
@@ -120,32 +119,20 @@ pub struct Repo {
     /// Logger
     log: slog::Logger,
 
-    aio: aio::AsyncIO,
+    pub aio: aio::AsyncIO,
 }
 
 impl Repo {
-    pub fn unlock_decrypt(
-        &self,
-        pass: PassphraseFn<'_>,
-    ) -> io::Result<DecryptHandle> {
+    pub fn unlock_decrypt(&self, pass: PassphraseFn<'_>) -> io::Result<DecryptHandle> {
         info!(self.log, "Opening read handle");
-        let decrypter = self
-            .config
-            .encryption
-            .decrypter(pass, &self.config.pwhash)?;
+        let decrypter = self.config.encryption.decrypter(pass, &self.config.pwhash)?;
 
         Ok(DecryptHandle { decrypter })
     }
 
-    pub fn unlock_encrypt(
-        &self,
-        pass: PassphraseFn<'_>,
-    ) -> io::Result<EncryptHandle> {
+    pub fn unlock_encrypt(&self, pass: PassphraseFn<'_>) -> io::Result<EncryptHandle> {
         info!(self.log, "Opening write handle");
-        let encrypter = self
-            .config
-            .encryption
-            .encrypter(pass, &self.config.pwhash)?;
+        let encrypter = self.config.encryption.encrypter(pass, &self.config.pwhash)?;
 
         Ok(EncryptHandle { encrypter })
     }
@@ -163,18 +150,11 @@ impl Repo {
     }
 
     /// Create new rdedup repository
-    pub fn init<L>(
-        url: &Url,
-        passphrase: PassphraseFn<'_>,
-        settings: settings::Repo,
-        log: L,
-    ) -> Result<Repo>
+    pub fn init<L>(url: &Url, passphrase: PassphraseFn<'_>, settings: settings::Repo, log: L) -> Result<Repo>
     where
         L: Into<Option<Logger>>,
     {
-        let log = log
-            .into()
-            .unwrap_or_else(|| Logger::root(slog::Discard, o!()));
+        let log = log.into().unwrap_or_else(|| Logger::root(slog::Discard, o!()));
 
         let backend = aio::backend_from_url(url)?;
         let aio = aio::AsyncIO::new(backend, log.clone())?;
@@ -196,13 +176,42 @@ impl Repo {
         })
     }
 
+    /// Create new rdedup repository
+    pub fn init_backend<L>(
+        backend: Box<dyn Backend + Send + Sync>,
+        passphrase: PassphraseFn<'_>,
+        settings: settings::Repo,
+        log: L,
+    ) -> Result<Repo>
+    where
+        L: Into<Option<Logger>>,
+    {
+        let log = log.into().unwrap_or_else(|| Logger::root(slog::Discard, o!()));
+
+        let aio = aio::AsyncIO::new(backend, log.clone())?;
+
+        Repo::ensure_repo_empty_or_new(&aio)?;
+        let config = config::Repo::new_from_settings(passphrase, settings)?;
+        config.write(&aio)?;
+
+        let compression = config.compression.to_engine();
+        let hasher = config.hashing.to_hasher();
+
+        Ok(Repo {
+            url: Url::parse("http://localhost").unwrap(),
+            config,
+            compression,
+            hasher,
+            log,
+            aio,
+        })
+    }
+
     pub fn open<L>(url: &Url, log: L) -> Result<Repo>
     where
         L: Into<Option<Logger>>,
     {
-        let log = log
-            .into()
-            .unwrap_or_else(|| Logger::root(slog::Discard, o!()));
+        let log = log.into().unwrap_or_else(|| Logger::root(slog::Discard, o!()));
 
         let backend = aio::backend_from_url(url)?;
         let aio = aio::AsyncIO::new(backend, log.clone())?;
@@ -222,24 +231,13 @@ impl Repo {
     }
 
     /// Change the passphrase
-    pub fn change_passphrase(
-        &mut self,
-        old_p: PassphraseFn<'_>,
-        new_p: PassphraseFn<'_>,
-    ) -> Result<()> {
+    pub fn change_passphrase(&mut self, old_p: PassphraseFn<'_>, new_p: PassphraseFn<'_>) -> Result<()> {
         let _lock = self.aio.lock_exclusive();
 
         if self.config.version == 0 {
-            Err(Error::new(
-                io::ErrorKind::NotFound,
-                "rdedup v0 config format not supported",
-            ))
+            Err(Error::new(io::ErrorKind::NotFound, "rdedup v0 config format not supported"))
         } else {
-            self.config.encryption.change_passphrase(
-                old_p,
-                new_p,
-                &self.config.pwhash,
-            )?;
+            self.config.encryption.change_passphrase(old_p, new_p, &self.config.pwhash)?;
             self.config.write(&self.aio)?;
             Ok(())
         }
@@ -266,32 +264,19 @@ impl Repo {
         let (digests_tx, digests_rx) = mpsc::channel();
 
         crossbeam::scope(move |scope| {
-            let mut timer = slog_perf::TimeReporter::new_with_level(
-                "index-processor",
-                self.log.clone(),
-                Level::Debug,
-            );
+            let mut timer = slog_perf::TimeReporter::new_with_level("index-processor", self.log.clone(), Level::Debug);
             timer.start("spawn-chunker");
 
             scope.spawn({
                 let process_tx = process_tx.clone();
                 move |_| {
-                    let mut timer = slog_perf::TimeReporter::new_with_level(
-                        "chunker",
-                        self.log.clone(),
-                        Level::Debug,
-                    );
+                    let mut timer = slog_perf::TimeReporter::new_with_level("chunker", self.log.clone(), Level::Debug);
 
-                    let chunker = chunking::Chunker::new(
-                        input_data_iter,
-                        self.config.chunking.to_engine(),
-                    );
+                    let chunker = chunking::Chunker::new(input_data_iter, self.config.chunking.to_engine());
 
                     let mut data = util::EnumerateU64::new(chunker);
 
-                    while let Some(i_sg) =
-                        timer.start_with("rx-and-chunking", || data.next())
-                    {
+                    while let Some(i_sg) = timer.start_with("rx-and-chunking", || data.next()) {
                         timer.start("tx");
                         let (i, sg) = i_sg;
                         process_tx
@@ -310,20 +295,12 @@ impl Repo {
             let mut digests_rx = SortingIterator::new(digests_rx.into_iter());
 
             timer.start("digest-rx");
-            let first_digest =
-                digests_rx.next().expect("At least one index digest");
+            let first_digest = digests_rx.next().expect("At least one index digest");
 
-            if let Some(second_digest) =
-                timer.start_with("digest-rx", || digests_rx.next())
-            {
+            if let Some(second_digest) = timer.start_with("digest-rx", || digests_rx.next()) {
                 let mut two_first = vec![first_digest, second_digest];
                 let mut address = self.chunk_and_write_data_thread(
-                    Box::new(
-                        two_first
-                            .drain(..)
-                            .chain(digests_rx)
-                            .map(|digest| digest.0),
-                    ),
+                    Box::new(two_first.drain(..).chain(digests_rx).map(|digest| digest.0)),
                     process_tx,
                     aio.clone(),
                     DataType::Index,
@@ -347,18 +324,11 @@ impl Repo {
         num_cpus::get()
     }
 
-    fn input_reader_thread<R>(
-        &self,
-        reader: R,
-        chunker_tx: mpsc::SyncSender<Vec<u8>>,
-    ) where
+    fn input_reader_thread<R>(&self, reader: R, chunker_tx: mpsc::SyncSender<Vec<u8>>)
+    where
         R: Read + Send,
     {
-        let mut time = TimeReporter::new_with_level(
-            "input-reader",
-            self.log.clone(),
-            Level::Debug,
-        );
+        let mut time = TimeReporter::new_with_level("input-reader", self.log.clone(), Level::Debug);
 
         let r2vi = ReaderVecIter::new(reader, INGRESS_BUFFER_SIZE);
         let mut while_ok = WhileOk::new(r2vi);
@@ -389,20 +359,10 @@ impl Repo {
         compression: ArcCompression,
         generations: Vec<Generation>,
     ) -> RecordingChunkAccessor<'a> {
-        RecordingChunkAccessor::new(
-            self,
-            accessed,
-            decrypter,
-            compression,
-            generations,
-        )
+        RecordingChunkAccessor::new(self, accessed, decrypter, compression, generations)
     }
 
-    fn wipe_generation_maybe(
-        &self,
-        gen: Generation,
-        min_age_secs: u64,
-    ) -> io::Result<()> {
+    fn wipe_generation_maybe(&self, gen: Generation, min_age_secs: u64) -> io::Result<()> {
         let gen_config = match gen.load_config(&self.aio) {
             Ok(c) => c,
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
@@ -416,9 +376,7 @@ impl Repo {
             Err(e) => return Err(e),
         };
 
-        if gen_config.created + chrono::Duration::seconds(min_age_secs as i64)
-            > chrono::Utc::now()
-        {
+        if gen_config.created + chrono::Duration::seconds(min_age_secs as i64) > chrono::Utc::now() {
             info!(
                 self.log,
                 "Generation is not old enough. Rerun GC later to finish";
@@ -439,36 +397,23 @@ impl Repo {
         // so that we don't leave garbage with no Generation
         // config file.
         substitute_err_not_found(
-            self.aio
-                .remove_dir_all(
-                    PathBuf::from(gen.to_string()).join(NAME_SUBDIR),
-                )
-                .wait(),
+            self.aio.remove_dir_all(PathBuf::from(gen.to_string()).join(NAME_SUBDIR)).wait(),
             || (),
         )?;
 
         substitute_err_not_found(
             self.aio
-                .remove_dir_all(
-                    PathBuf::from(gen.to_string()).join(config::DATA_SUBDIR),
-                )
+                .remove_dir_all(PathBuf::from(gen.to_string()).join(config::DATA_SUBDIR))
                 .wait(),
             || (),
         )?;
 
-        self.aio
-            .remove_dir_all(PathBuf::from(gen.to_string()))
-            .wait()?;
+        self.aio.remove_dir_all(PathBuf::from(gen.to_string())).wait()?;
 
         Ok(())
     }
 
-    fn update_name_to(
-        &self,
-        name_str: &str,
-        cur_gen: Generation,
-        generations: &[Generation],
-    ) -> io::Result<()> {
+    fn update_name_to(&self, name_str: &str, cur_gen: Generation, generations: &[Generation]) -> io::Result<()> {
         // traverse all the chunks (both index and data)
         // and move all the chunks to the newest gen
         info!(
@@ -480,19 +425,10 @@ impl Repo {
         let name = Name::load_from_any(name_str, generations, &self.aio)?;
         let data_address: DataAddress = name.into();
 
-        let accessor = GenerationUpdateChunkAccessor::new(
-            self,
-            Arc::clone(&self.compression),
-            generations.to_vec(),
-        );
+        let accessor = GenerationUpdateChunkAccessor::new(self, Arc::clone(&self.compression), generations.to_vec());
         {
             let traverser = ReadContext::new(&accessor);
-            traverser.read_recursively(ReadRequest::new(
-                DataType::Data,
-                data_address.as_ref(),
-                None,
-                self.log.clone(),
-            ))?;
+            traverser.read_recursively(ReadRequest::new(DataType::Data, data_address.as_ref(), None, self.log.clone()))?;
         }
 
         Name::update_generation_to(name_str, cur_gen, generations, &self.aio)?;
@@ -508,19 +444,9 @@ impl Repo {
     ) -> Result<()> {
         reachable_digests.insert(da.digest.0.into());
 
-        let accessor = self.get_recording_chunk_accessor(
-            reachable_digests,
-            None,
-            Arc::clone(&self.compression),
-            generations,
-        );
+        let accessor = self.get_recording_chunk_accessor(reachable_digests, None, Arc::clone(&self.compression), generations);
         let traverser = ReadContext::new(&accessor);
-        traverser.read_recursively(ReadRequest::new(
-            DataType::Data,
-            da,
-            None,
-            self.log.clone(),
-        ))
+        traverser.read_recursively(ReadRequest::new(DataType::Data, da, None, self.log.clone()))
     }
 
     /// Return all reachable chunks
@@ -534,11 +460,7 @@ impl Repo {
                 Ok(name) => {
                     let data_address: DataAddress = name.into();
                     info!(self.log, "processing"; "name" => name_str);
-                    self.reachable_recursively_insert(
-                        data_address.as_ref(),
-                        &mut reachable_digests,
-                        generations.clone(),
-                    )?;
+                    self.reachable_recursively_insert(data_address.as_ref(), &mut reachable_digests, generations.clone())?;
                 }
                 Err(e) => {
                     info!(
@@ -553,16 +475,8 @@ impl Repo {
         Ok(reachable_digests)
     }
 
-    fn chunk_rel_path_by_digest(
-        &self,
-        digest: DigestRef<'_>,
-        gen_str: &str,
-    ) -> PathBuf {
-        self.config.nesting.get_path(
-            Path::new(config::DATA_SUBDIR),
-            digest.0,
-            gen_str,
-        )
+    fn chunk_rel_path_by_digest(&self, digest: DigestRef<'_>, gen_str: &str) -> PathBuf {
+        self.config.nesting.get_path(Path::new(config::DATA_SUBDIR), digest.0, gen_str)
     }
 
     pub fn list_names(&self) -> io::Result<Vec<String>> {
@@ -628,12 +542,7 @@ impl Repo {
         }
     }
 
-    pub fn read<W: Write>(
-        &self,
-        name_str: &str,
-        writer: &mut W,
-        dec: &DecryptHandle,
-    ) -> Result<()> {
+    pub fn read<W: Write>(&self, name_str: &str, writer: &mut W, dec: &DecryptHandle) -> Result<()> {
         let _lock = self.aio.lock_shared();
 
         let generations = self.read_generations()?;
@@ -641,11 +550,7 @@ impl Repo {
         let name = Name::load_from_any(name_str, &generations, &self.aio)?;
         let data_address: DataAddress = name.into();
 
-        let accessor = self.get_chunk_accessor(
-            Some(Arc::clone(&dec.decrypter)),
-            Arc::clone(&self.compression),
-            generations,
-        );
+        let accessor = self.get_chunk_accessor(Some(Arc::clone(&dec.decrypter)), Arc::clone(&self.compression), generations);
         let traverser = ReadContext::new(&accessor);
         traverser.read_recursively(ReadRequest::new(
             DataType::Data,
@@ -663,12 +568,7 @@ impl Repo {
         let data_address: DataAddress = name.into();
 
         let mut counter = CounterWriter::new();
-        let accessor = VerifyingChunkAccessor::new(
-            self,
-            Some(Arc::clone(&dec.decrypter)),
-            Arc::clone(&self.compression),
-            generations,
-        );
+        let accessor = VerifyingChunkAccessor::new(self, Some(Arc::clone(&dec.decrypter)), Arc::clone(&self.compression), generations);
         {
             let traverser = ReadContext::new(&accessor);
             traverser.read_recursively(ReadRequest::new(
@@ -684,11 +584,7 @@ impl Repo {
         })
     }
 
-    pub fn verify(
-        &self,
-        name_str: &str,
-        dec: &DecryptHandle,
-    ) -> Result<VerifyResults> {
+    pub fn verify(&self, name_str: &str, dec: &DecryptHandle) -> Result<VerifyResults> {
         let _lock = self.aio.lock_shared();
 
         let generations = self.read_generations()?;
@@ -697,12 +593,7 @@ impl Repo {
         let data_address: DataAddress = name.into();
 
         let mut counter = CounterWriter::new();
-        let accessor = VerifyingChunkAccessor::new(
-            self,
-            Some(Arc::clone(&dec.decrypter)),
-            Arc::clone(&self.compression),
-            generations,
-        );
+        let accessor = VerifyingChunkAccessor::new(self, Some(Arc::clone(&dec.decrypter)), Arc::clone(&self.compression), generations);
         {
             let traverser = ReadContext::new(&accessor);
             traverser.read_recursively(ReadRequest::new(
@@ -722,32 +613,21 @@ impl Repo {
             .wait()?
             .iter()
             .filter_map(|path| path.file_name().and_then(|file| file.to_str()))
-            .filter(|&item| {
-                item != config::CONFIG_YML_FILE
-                    && item != config::LOCK_FILE
-                    && !item.ends_with(".yml")
-            })
+            .filter(|&item| item != config::CONFIG_YML_FILE && item != config::LOCK_FILE && !item.ends_with(".yml"))
             .filter_map(|item| match Generation::try_from(item) {
                 Ok(gen) => {
-                    if self.aio.read_metadata(gen.config_path()).wait().is_ok()
-                    {
+                    let buf = gen.config_path();
+                    info!(self.log, "Read generations metadata: {:?}", buf);
+
+                    if self.aio.read_metadata(buf).wait().is_ok() {
                         Some(gen)
                     } else {
-                        warn!(
-                            self.log,
-                            "skipping dead generation: `{}` (config missing)",
-                            item,
-                        );
+                        warn!(self.log, "skipping dead generation: `{}` (config missing)", item,);
                         None
                     }
                 }
                 Err(e) => {
-                    warn!(
-                        self.log,
-                        "skipping unknown generation: `{}` due to: `{}`",
-                        item,
-                        e
-                    );
+                    warn!(self.log, "skipping unknown generation: `{}` due to: `{}`", item, e);
                     None
                 }
             })
@@ -757,12 +637,7 @@ impl Repo {
         Ok(list)
     }
 
-    pub fn write<R>(
-        &self,
-        name_str: &str,
-        reader: R,
-        enc: &EncryptHandle,
-    ) -> Result<WriteStats>
+    pub fn write<R>(&self, name_str: &str, reader: R, enc: &EncryptHandle) -> Result<WriteStats>
     where
         R: Read + Send,
     {
@@ -777,15 +652,10 @@ impl Repo {
             generations.push(gen_first);
         }
 
-        let mut timer = slog_perf::TimeReporter::new_with_level(
-            "write",
-            self.log.clone(),
-            Level::Info,
-        );
+        let mut timer = slog_perf::TimeReporter::new_with_level("write", self.log.clone(), Level::Info);
         timer.start("write");
         let num_threads = num_cpus::get();
-        let (chunker_tx, chunker_rx) =
-            mpsc::sync_channel(self.write_cpu_thread_num());
+        let (chunker_tx, chunker_rx) = mpsc::sync_channel(self.write_cpu_thread_num());
 
         let backend = backend_from_url(&self.url)?;
         let aio = aio::AsyncIO::new(backend, self.log.clone())?;
@@ -806,28 +676,14 @@ impl Repo {
                 let hasher = Arc::clone(&self.hasher);
                 let generations = generations.clone();
                 scope.spawn(move |_| {
-                    let processor = ChunkProcessor::new(
-                        self.clone(),
-                        process_rx,
-                        aio,
-                        encrypter,
-                        compression,
-                        hasher,
-                        generations,
-                    );
+                    let processor = ChunkProcessor::new(self.clone(), process_rx, aio, encrypter, compression, hasher, generations);
                     processor.run();
                 });
             }
             drop(process_rx);
 
-            let chunk_and_write = scope.spawn(move |_| {
-                self.chunk_and_write_data_thread(
-                    Box::new(chunker_rx.into_iter()),
-                    process_tx,
-                    aio,
-                    DataType::Data,
-                )
-            });
+            let chunk_and_write =
+                scope.spawn(move |_| self.chunk_and_write_data_thread(Box::new(chunker_rx.into_iter()), process_tx, aio, DataType::Data));
 
             chunk_and_write.join()
         })
