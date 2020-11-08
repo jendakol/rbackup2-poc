@@ -3,6 +3,7 @@ use log::{debug, info, trace};
 use std::net::SocketAddr;
 use std::str::FromStr;
 
+mod backend_pool;
 mod handlers;
 
 #[actix_rt::main]
@@ -16,7 +17,6 @@ async fn main() {
     HttpServer::new(move || {
         App::new()
             .service(handlers::list)
-            .service(handlers::list_recursively)
             .service(handlers::write)
             .service(handlers::read)
             .service(handlers::read_metadata)

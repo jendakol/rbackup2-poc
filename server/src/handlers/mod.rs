@@ -1,24 +1,29 @@
 use std::io;
 use std::io::{Read, Write};
+use std::mem::ManuallyDrop;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 
 use actix_http::body::Body;
 use actix_web::body::BodyStream;
 use actix_web::{delete, error, get, post, put, web, HttpRequest, HttpResponse, Responder};
+use bumpalo::{collections::Vec as BumpaloVec, Bump};
 use futures::io::{BufReader, Error};
 use futures::StreamExt;
 use libcommon::structs::{ListResponse, ReadMetadataResponse, SharedLockResponse};
 use log::*;
 use once_cell::sync::Lazy;
-use rdedup_lib::aio::{Backend, Local, Lock};
+use rdedup_lib::aio::{Backend, BackendThread, Local, Lock};
 use serde::ser::{SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
 use sgdata::SGData;
 use sha2::*;
 use uuid::Uuid;
+
+use crate::backend_pool;
 
 mod blocking_writer;
 
@@ -40,9 +45,9 @@ pub struct UnlockQuery {
 pub async fn list(query: web::Query<PathQuery>) -> impl Responder {
     trace!("list {:?}", *query);
 
-    let mut thread = BACKEND.new_thread().unwrap();
+    let mut backend = backend_pool::pull().expect("Unavailable backend thread");
 
-    match thread.list(query.path.clone()) {
+    match backend.thread.list(query.path.clone()) {
         Ok(result) => HttpResponse::Ok().json(ListResponse { paths: result }),
         Err(e) => {
             warn!("Error while listing path {:?}: {}", query.path, e);
@@ -52,39 +57,13 @@ pub async fn list(query: web::Query<PathQuery>) -> impl Responder {
     .await
 }
 
-#[get("/list-recursively")]
-pub async fn list_recursively(query: web::Query<PathQuery>) -> impl Responder {
-    trace!("list recursively {:?}", *query);
-
-    let mut thread = BACKEND.new_thread().unwrap();
-
-    let (tx, rx) = mpsc::channel::<io::Result<Vec<PathBuf>>>();
-
-    thread.list_recursively(query.path.clone(), tx);
-
-    let (w, stream) = blocking_writer::create();
-
-    thread::spawn(move || {
-        let iter = rx.into_iter();
-        let mut ser = serde_json::Serializer::new(w);
-
-        for items in iter {
-            if let Ok(paths) = items {
-                ListResponse { paths }.serialize(&mut ser);
-            }
-        }
-    });
-
-    HttpResponse::Ok().body(BodyStream::new(stream))
-}
-
 #[get("/read-metadata")]
 pub async fn read_metadata(query: web::Query<PathQuery>) -> impl Responder {
     trace!("read_metadata {:?}", *query);
 
-    let mut thread = BACKEND.new_thread().unwrap();
+    let mut backend = backend_pool::pull().expect("Unavailable backend thread");
 
-    match thread.read_metadata(query.path.clone()) {
+    match backend.thread.read_metadata(query.path.clone()) {
         Ok(result) => HttpResponse::Ok().json(ReadMetadataResponse {
             len: result._len,
             is_file: result._is_file,
@@ -102,9 +81,9 @@ pub async fn read_metadata(query: web::Query<PathQuery>) -> impl Responder {
 pub async fn read(query: web::Query<PathQuery>) -> impl Responder {
     trace!("read {:?}", *query);
 
-    let mut thread = BACKEND.new_thread().unwrap();
+    let mut backend = backend_pool::pull().expect("Unavailable backend thread");
 
-    match thread.read(query.path.clone()) {
+    match backend.thread.read(query.path.clone()) {
         Ok(result) => HttpResponse::Ok().body(Body::from(result.to_linear_vec())), // TODO streaming?
         Err(e) => {
             warn!("Error while reading {:?}: {}", query.path, e);
@@ -122,7 +101,10 @@ pub async fn write(request: HttpRequest, mut payload: web::Payload) -> impl Resp
 
     trace!("write {:?} {}", path, hash_reported);
 
-    let mut body = web::BytesMut::new();
+    let mut backend = backend_pool::pull().expect("Unavailable backend thread");
+
+    let mut body = Vec::with_capacity(MAX_SIZE);
+
     while let Some(chunk) = payload.next().await {
         let chunk = chunk?;
         // limit max size of in-memory payload
@@ -136,23 +118,19 @@ pub async fn write(request: HttpRequest, mut payload: web::Payload) -> impl Resp
         body.extend_from_slice(&chunk);
     }
 
-    let bytes = body.to_vec();
-
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    hasher.update(&*body);
     let hash = hex::encode(&hasher.finalize());
 
     trace!(
         "Writing path {:?} length {}B hash {} reported hash {}",
         path,
-        bytes.len(),
+        body.len(),
         hash,
         hash_reported
     );
 
-    let mut thread = BACKEND.new_thread().unwrap();
-
-    match thread.write(path.clone(), SGData::from_single(bytes), true) {
+    match backend.thread.write(path.clone(), SGData::from_single(body), true) {
         Ok(_) => HttpResponse::Ok().finish(),
         Err(e) => {
             warn!("Error while writing path {:?}: {}", path, e);
@@ -166,7 +144,10 @@ pub async fn write(request: HttpRequest, mut payload: web::Payload) -> impl Resp
 pub async fn lock_shared_add() -> impl Responder {
     trace!("lock shared add");
 
-    match BACKEND.lock_shared() {
+    let backend = backend_pool::pull().expect("Unavailable backend thread");
+
+    // TODO save shared lock to prevent dropping!
+    match backend.lock_shared() {
         Ok(_) => HttpResponse::Created().json(SharedLockResponse { lock_id: Uuid::new_v4() }),
         Err(e) => {
             warn!("Error while creating shared lock: {}", e);
