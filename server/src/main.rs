@@ -1,7 +1,8 @@
-use actix_web::{middleware, web, App, FromRequest, HttpRequest, HttpServer, Result as ActixResult};
-use log::{debug, info, trace};
 use std::net::SocketAddr;
 use std::str::FromStr;
+
+use actix_web::{App, HttpServer};
+use log::*;
 
 mod backend_pool;
 mod handlers;

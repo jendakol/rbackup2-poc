@@ -5,18 +5,16 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use err_context::AnyError;
-use libcommon::structs::{ListResponse, ReadMetadataResponse, SharedLockResponse};
+use libcommon::structs::{ListResponse, SharedLockResponse};
 use log::*;
 use once_cell::sync::Lazy;
+use rdedup_lib::backends::{Backend, BackendThread, Lock, Metadata};
 use reqwest::blocking::{Body, Client};
 use reqwest::StatusCode;
 use sgdata::SGData;
 use sha2::*;
-use url2::Url;
-
+use url::Url;
 use uuid::Uuid;
-
-use crate::{Backend, BackendThread, Lock, Metadata};
 
 static CLIENT: Lazy<Client> = Lazy::new(|| Client::builder().connection_verbose(false).build().unwrap());
 
@@ -119,11 +117,11 @@ fn calculate_digest(sg: &SGData) -> Vec<u8> {
 }
 
 impl BackendThread for RemoteBackendThread {
-    fn remove_dir_all(&mut self, path: PathBuf) -> io::Result<()> {
+    fn remove_dir_all(&mut self, _path: PathBuf) -> io::Result<()> {
         unimplemented!()
     }
 
-    fn rename(&mut self, src_path: PathBuf, dst_path: PathBuf) -> io::Result<()> {
+    fn rename(&mut self, _src_path: PathBuf, _dst_path: PathBuf) -> io::Result<()> {
         unimplemented!()
     }
 
@@ -143,7 +141,7 @@ impl BackendThread for RemoteBackendThread {
             .header("hash", hash)
             .body(Body::new(data))
             .send()
-            .map_err(|e| (Error::new(ErrorKind::BrokenPipe, AnyError::from("Invalid response"))))?;
+            .map_err(|e| (Error::new(ErrorKind::BrokenPipe, e)))?;
 
         if resp.status() != StatusCode::OK {
             trace!("Received: {:?}", resp);
@@ -162,20 +160,22 @@ impl BackendThread for RemoteBackendThread {
         url.query_pairs_mut()
             .append_pair("path", path.to_str().expect("Invalid utf-8 path"));
 
-        let resp = CLIENT
-            .get(url)
-            .send()
-            .map_err(|e| (Error::new(ErrorKind::BrokenPipe, AnyError::from("Invalid response"))))?;
+        let resp = CLIENT.get(url).send().map_err(|e| (Error::new(ErrorKind::BrokenPipe, e)))?;
 
-        if resp.status() != StatusCode::OK {
-            trace!("Received: {:?}", resp);
-            return Err(Error::new(ErrorKind::InvalidData, AnyError::from("Invalid response")));
+        match resp.status() {
+            StatusCode::OK => Ok(SGData::from_single(resp.bytes().unwrap().to_vec())),
+            StatusCode::NOT_FOUND => {
+                trace!("Received: {:?}", resp);
+                Err(Error::new(ErrorKind::NotFound, AnyError::from("File not found")))
+            }
+            _ => {
+                trace!("Received: {:?}", resp);
+                Err(Error::new(ErrorKind::InvalidData, AnyError::from("Invalid response")))
+            }
         }
-
-        Ok(SGData::from_single(resp.bytes().unwrap().to_vec()))
     }
 
-    fn remove(&mut self, path: PathBuf) -> io::Result<()> {
+    fn remove(&mut self, _path: PathBuf) -> io::Result<()> {
         unimplemented!()
     }
 
@@ -187,28 +187,22 @@ impl BackendThread for RemoteBackendThread {
         url.query_pairs_mut()
             .append_pair("path", path.to_str().expect("Invalid utf-8 path"));
 
-        let resp = CLIENT
-            .get(url)
-            .send()
-            .map_err(|e| (Error::new(ErrorKind::BrokenPipe, AnyError::from("Invalid response"))))?;
-
-        if resp.status() != StatusCode::OK && resp.status() != StatusCode::NOT_FOUND {
-            trace!("Received: {:?}", resp);
-        }
+        let resp = CLIENT.get(url).send().map_err(|e| (Error::new(ErrorKind::BrokenPipe, e)))?;
 
         match resp.status() {
             StatusCode::OK => {
-                let rmr = resp.json::<ReadMetadataResponse>().unwrap();
-
-                debug!("Received {:?}", rmr);
-
-                Ok(Metadata {
-                    _len: rmr.len,
-                    _is_file: rmr.is_file,
-                })
+                let metadata = resp.json::<Metadata>().unwrap();
+                debug!("Received {:?}", metadata);
+                Ok(metadata)
             }
-            StatusCode::NOT_FOUND => Err(Error::new(ErrorKind::NotFound, AnyError::from("File not found"))),
-            _ => Err(Error::new(ErrorKind::InvalidData, AnyError::from("Invalid response"))),
+            StatusCode::NOT_FOUND => {
+                trace!("Received: {:?}", resp);
+                Err(Error::new(ErrorKind::NotFound, AnyError::from("File not found")))
+            }
+            _ => {
+                trace!("Received: {:?}", resp);
+                Err(Error::new(ErrorKind::InvalidData, AnyError::from("Invalid response")))
+            }
         }
     }
 
@@ -220,10 +214,7 @@ impl BackendThread for RemoteBackendThread {
         url.query_pairs_mut()
             .append_pair("path", path.to_str().expect("Invalid utf-8 path"));
 
-        let resp = CLIENT
-            .get(url)
-            .send()
-            .map_err(|e| (Error::new(ErrorKind::BrokenPipe, AnyError::from("Invalid response"))))?;
+        let resp = CLIENT.get(url).send().map_err(|e| (Error::new(ErrorKind::BrokenPipe, e)))?;
 
         if resp.status() != StatusCode::OK {
             trace!("Received: {:?}", resp);
@@ -237,31 +228,8 @@ impl BackendThread for RemoteBackendThread {
         Ok(lr.paths)
     }
 
-    fn list_recursively(&mut self, path: PathBuf, tx: Sender<io::Result<Vec<PathBuf>>>) {
-        trace!("remote list: {:?}", path);
-
-        let mut url = self.backend.server_url.clone();
-        url.set_path("list-recursively");
-        url.query_pairs_mut()
-            .append_pair("path", path.to_str().expect("Invalid utf-8 path"));
-
-        let resp = CLIENT
-            .get(url)
-            .send()
-            .map_err(|e| (Error::new(ErrorKind::BrokenPipe, AnyError::from("Invalid response"))))
-            .unwrap();
-
-        if resp.status() != StatusCode::OK {
-            trace!("Received: {:?}", resp);
-        }
-
-        let bytes = resp.bytes().unwrap();
-
-        let stream = serde_json::Deserializer::from_slice(bytes.as_ref()).into_iter::<ListResponse>();
-
-        for values in stream {
-            tx.send(values.map(|r| r.paths).map_err(|e| Error::new(ErrorKind::InvalidData, e)));
-        }
+    fn list_recursively(&mut self, _path: PathBuf, _tx: Sender<io::Result<Vec<PathBuf>>>) {
+        unreachable!("This method should have never been called - it's unused in rdedup")
     }
 }
 

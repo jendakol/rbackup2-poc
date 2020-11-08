@@ -8,12 +8,6 @@ pub struct ListResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ReadMetadataResponse {
-    pub len: u64,
-    pub is_file: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct SharedLockResponse {
     pub lock_id: Uuid,
 }

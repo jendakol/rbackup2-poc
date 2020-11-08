@@ -1,4 +1,4 @@
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -6,7 +6,8 @@ use std::sync::Arc;
 use log::*;
 use object_pool::{Pool, Reusable};
 use once_cell::sync::Lazy;
-use rdedup_lib::aio::{Backend, BackendThread, Local};
+use rdedup_lib::backends::local::Local;
+use rdedup_lib::backends::{Backend, BackendThread};
 
 static BACKEND: Lazy<Arc<Local>> = Lazy::new(|| Arc::new(Local::new(PathBuf::from_str("/home/jenda/dev/rbackup2-poc/data").unwrap())));
 
@@ -20,7 +21,7 @@ static BACKEND_POOL: Lazy<Pool<PooledBackend>> = Lazy::new(|| {
 });
 
 pub fn pull<'a>() -> Option<Reusable<'a, PooledBackend>> {
-    BACKEND_POOL.try_pull().map(|mut b| {
+    BACKEND_POOL.try_pull().map(|b| {
         trace!("Borrowing pooled backend");
         b
     })

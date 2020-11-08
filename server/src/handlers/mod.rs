@@ -1,35 +1,20 @@
 use std::io;
-use std::io::{Read, Write};
-use std::mem::ManuallyDrop;
-use std::ops::Deref;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{mpsc, Arc};
-use std::thread;
 
 use actix_http::body::Body;
-use actix_web::body::BodyStream;
 use actix_web::{delete, error, get, post, put, web, HttpRequest, HttpResponse, Responder};
-use bumpalo::{collections::Vec as BumpaloVec, Bump};
-use futures::io::{BufReader, Error};
 use futures::StreamExt;
-use libcommon::structs::{ListResponse, ReadMetadataResponse, SharedLockResponse};
+use libcommon::structs::{ListResponse, SharedLockResponse};
 use log::*;
-use once_cell::sync::Lazy;
-use rdedup_lib::aio::{Backend, BackendThread, Local, Lock};
-use serde::ser::{SerializeSeq, Serializer};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sgdata::SGData;
 use sha2::*;
 use uuid::Uuid;
 
 use crate::backend_pool;
 
-mod blocking_writer;
-
-const MAX_SIZE: usize = 1_000_000; // up to 1M chunks
-
-static BACKEND: Lazy<Local> = Lazy::new(|| Local::new(PathBuf::from_str("/home/jenda/dev/rbackup2-poc/data").unwrap()));
+const MAX_SIZE: usize = 1_000_000; // up to 1M sized chunks
 
 #[derive(Debug, Deserialize)]
 pub struct PathQuery {
@@ -64,10 +49,7 @@ pub async fn read_metadata(query: web::Query<PathQuery>) -> impl Responder {
     let mut backend = backend_pool::pull().expect("Unavailable backend thread");
 
     match backend.thread.read_metadata(query.path.clone()) {
-        Ok(result) => HttpResponse::Ok().json(ReadMetadataResponse {
-            len: result._len,
-            is_file: result._is_file,
-        }),
+        Ok(result) => HttpResponse::Ok().json(result),
         Err(e) if e.kind() == io::ErrorKind::NotFound => HttpResponse::NotFound().finish(),
         Err(e) => {
             warn!("Error while reading metadata for {:?}: {}", query.path, e);
@@ -85,6 +67,7 @@ pub async fn read(query: web::Query<PathQuery>) -> impl Responder {
 
     match backend.thread.read(query.path.clone()) {
         Ok(result) => HttpResponse::Ok().body(Body::from(result.to_linear_vec())), // TODO streaming?
+        Err(e) if e.kind() == io::ErrorKind::NotFound => HttpResponse::NotFound().finish(),
         Err(e) => {
             warn!("Error while reading {:?}: {}", query.path, e);
             HttpResponse::InternalServerError().body(format!("Error: {:?}", e))

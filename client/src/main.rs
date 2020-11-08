@@ -1,27 +1,36 @@
-use err_context::AnyError;
-use log::*;
-use rdedup_lib::Repo as RdedupRepo;
-use std::path::PathBuf;
-use std::str::FromStr;
+use std::io;
 
-#[tokio::main]
-async fn main() -> Result<(), AnyError> {
+use err_context::AnyError;
+use log::debug;
+use rdedup_lib::backends::Backend;
+use rdedup_lib::{PassphraseFn, Repo as RdedupRepo};
+
+use crate::remote::RemoteBackend;
+
+mod remote;
+
+fn create_backend(u: &url1::Url) -> io::Result<Box<dyn Backend + Send + Sync>> {
+    Ok(Box::new(RemoteBackend::new(url::Url::parse(&u.to_string()).unwrap())))
+}
+
+fn main() -> Result<(), AnyError> {
     env_logger::init();
 
-    let passfn = || Ok("prdel".to_owned());
+    let passfn: PassphraseFn = &|| Ok("prdel".to_owned());
 
-    // let repo = RdedupRepo::init(
+    // let repo = RdedupRepo::init_custom(
     //     &url1::Url::parse("http://localhost:8090")?,
+    //     &backendfn,
     //     &passfn,
     //     rdedup_lib::settings::Repo::new(),
     //     None,
     // )?;
 
-    let repo = RdedupRepo::open(&url1::Url::parse("http://localhost:8090")?, None)?;
+    let repo = RdedupRepo::open_custom(&url1::Url::parse("http://localhost:8090")?, &create_backend, None)?;
 
-    let source = "/data/Fotky/A7III/DSC00382.ARW";
+    let source = "/data/Fotky/A7III/DSC00383.ARW";
     // let source = "/data/Fotky/DSC27456.ARW";
-    let dest = "filename3.dat";
+    let dest = "filename4.dat";
 
     let wh = repo.unlock_encrypt(&passfn)?;
     let file = std::fs::File::open(source)?;
@@ -34,12 +43,6 @@ async fn main() -> Result<(), AnyError> {
 
     let meta = file.metadata()?;
     println!("Meta: {:?}", meta);
-
-    // let iter = repo.aio.list_recursively(PathBuf::from_str(".").unwrap());
-    //
-    // for item in iter {
-    //     trace!("Recursive listed: {:?}", item)
-    // }
 
     Ok(())
 }
